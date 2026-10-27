@@ -136,6 +136,11 @@ class Config:
         self.verbose: bool = self.DEFAULT_VERBOSE
         self._load_config()
 
+    @staticmethod
+    def _fmt_set(v: Optional[str]) -> str:
+        """把环境变量值格式化为「已设置/未设置」文本"""
+        return "已设置" if v else "未设置"
+
     def _load_config(self) -> None:
         """加载配置"""
         push_key_env: Optional[str] = os.environ.get(self.ENV_PUSH_KEY)
@@ -187,12 +192,19 @@ class Config:
                 self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
+
+        # 预先计算钉钉加签状态描述，避免在 f-string 表达式内使用转义引号（会触发 SyntaxError）
+        if dingtalk_webhook_env:
+            dingtalk_secret_status = f", 加签 {'已设置' if dingtalk_secret_env else '未设置'}"
+        else:
+            dingtalk_secret_status = ""
+
         logger.info(
             f"{LogEmoji.INFO} 推送配置: "
-            f"{self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}, "
-            f"{self.ENV_SERVERCHAN_KEY} {'已设置' if serverchan_key_env else '未设置'}, "
-            f"{self.ENV_DINGTALK_WEBHOOK} {'已设置' if dingtalk_webhook_env else '未设置'}"
-            f"{f', 加签 {\"已设置\" if dingtalk_secret_env else \"未设置\"}' if dingtalk_webhook_env else ''}。"
+            f"{self.ENV_PUSH_KEY} {self._fmt_set(push_key_env)}, "
+            f"{self.ENV_SERVERCHAN_KEY} {self._fmt_set(serverchan_key_env)}, "
+            f"{self.ENV_DINGTALK_WEBHOOK} {self._fmt_set(dingtalk_webhook_env)}"
+            f"{dingtalk_secret_status}。"
         )
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
@@ -610,20 +622,26 @@ class DingTalkBackend(PushBackend):
 
     def send(self, title: str, payload: dict) -> bool:
         url = self._signed_url()
-        content = f"### {title}\n\n{self._render(payload)}"
+        # 标题已带 # 前缀时剥掉，避免钉钉渲染成 "### # xxx"
+        clean_title = title.lstrip("#").strip() or "GLaDOS 签到"
+        content = f"### {clean_title}\n\n{self._render(payload)}"
         body = {
             "msgtype": "markdown",
             "markdown": {
-                "title": title,
+                "title": clean_title,
                 "text": content,
             },
         }
         try:
             resp = requests.post(url, json=body, timeout=(10, 30))
             if not resp.ok:
-                logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: HTTP {resp.status_code} {resp.text}")
+                logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: HTTP {resp.status_code} {resp.text[:200]}")
                 return False
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError:
+                logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: 非 JSON 响应 {resp.text[:200]}")
+                return False
             if data.get("errcode") == 0:
                 return True
             logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: {data.get('errmsg', data)}（请检查关键词/加签/IP 白名单等安全设置）")
@@ -636,7 +654,7 @@ class DingTalkBackend(PushBackend):
 class PushService:
     """推送服务：聚合多个后端，向全部已配置后端发送（都发）"""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Optional[Config]):
         self.backends: List[PushBackend] = []
         if config:
             if getattr(config, "push_key", ""):
